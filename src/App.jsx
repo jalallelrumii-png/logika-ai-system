@@ -5,7 +5,7 @@ import {
 } from "recharts";
 
 // ─────────────────────────────────────────────────────────────
-// 1. DESIGN SYSTEM & DATA (Tetap sama seperti asli)
+// 1. DESIGN SYSTEM & CONFIG
 // ─────────────────────────────────────────────────────────────
 const P = {
   bg: "#06090F", surface: "#0C1220", surfaceHigh: "#111B2E",
@@ -14,7 +14,95 @@ const P = {
   text: "#E2E8F0", sub: "#94A3B8", muted: "#475569",
 };
 
-// Data Default (Akan di-override jika ada data di localStorage)
+const CONFIG = {
+  STORAGE_KEY: 'financial_data_v2',
+  MIN_MONTHS: 3,
+  MAX_MONTHS: 36,
+};
+
+// ─────────────────────────────────────────────────────────────
+// 2. CSV PARSER PRODUCTION
+// ─────────────────────────────────────────────────────────────
+const parseCSV = (text, fileName = '') => {
+  const errors = [];
+  const warnings = [];
+  
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim().split('\n');
+  if (lines.length < 2) {
+    throw new Error("File CSV kosong atau tidak valid");
+  }
+
+  const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/"/g, ''));
+  
+  const colMap = {
+    bulan: ['bulan', 'period', 'month', 'periode', 'tanggal', 'date', 'b'],
+    pendapatan: ['pendapatan', 'revenue', 'income', 'penjualan', 'sales', 'p', 'omzet'],
+    beban: ['beban', 'expense', 'expenses', 'cost', 'biaya', 'pengeluaran', 'e', 'costs'],
+  };
+
+  const findColumn = (types) => {
+    for (let type of types) {
+      const idx = headers.findIndex(h => h.includes(type));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  const bIdx = findColumn(colMap.bulan);
+  const pIdx = findColumn(colMap.pendapatan);
+  const eIdx = findColumn(colMap.beban);
+
+  if (bIdx === -1) errors.push("Kolom 'bulan' tidak ditemukan");
+  if (pIdx === -1) errors.push("Kolom 'pendapatan' tidak ditemukan");
+  if (eIdx === -1) errors.push("Kolom 'beban' tidak ditemukan");
+
+  if (errors.length > 0) {
+    throw new Error(errors.join(', '));
+  }
+
+  const data = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const vals = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(v => v.trim().replace(/^"|"$/g, ''));
+    
+    const bulan = vals[bIdx] || '';
+    const pendapatan = parseFloat(vals[pIdx]?.replace(/[^0-9.-]/g, '')) || 0;
+    const beban = parseFloat(vals[eIdx]?.replace(/[^0-9.-]/g, '')) || 0;
+
+    if (!bulan) {
+      warnings.push(`Baris ${i + 1}: Bulan kosong, dilewati`);
+      continue;
+    }
+
+    data.push({
+      b: bulan,
+      p: Math.abs(pendapatan),
+      e: Math.abs(beban),
+      laba: Math.abs(pendapatan) - Math.abs(beban),
+      gpm: pendapatan > 0 ? parseFloat(((Math.abs(pendapatan) - Math.abs(beban)) / Math.abs(pendapatan) * 100).toFixed(1)) : 0,
+      anomali: Math.abs(beban) > Math.abs(pendapatan) * 0.9,
+    });
+  }
+
+  if (data.length < CONFIG.MIN_MONTHS) {
+    errors.push(`Data minimal ${CONFIG.MIN_MONTHS} bulan, ditemukan ${data.length} bulan`);
+  }
+
+  return { data, errors, warnings };
+};
+
+// ─────────────────────────────────────────────────────────────
+// 3. DATA PROCESSING
+// ─────────────────────────────────────────────────────────────
+const processData = (raw) => raw.map(d => ({
+  bulan: d.b, pendapatan: d.p, beban: d.e,
+  laba: d.p - d.e,
+  gpm: parseFloat(((d.p - d.e) / d.p * 100).toFixed(1)),
+  anomali: d.e > d.p * 0.9,
+}));
+
 const RAW_DEFAULT = [
   { b: "Jul'24", p: 285, e: 198 }, { b: "Agu'24", p: 312, e: 215 },
   { b: "Sep'24", p: 298, e: 225 }, { b: "Okt'24", p: 340, e: 210 },
@@ -23,15 +111,8 @@ const RAW_DEFAULT = [
   { b: "Mar'25", p: 335, e: 285 },
 ];
 
-const processData = (raw) => raw.map(d => ({
-  bulan: d.b, pendapatan: d.p, beban: d.e,
-  laba: d.p - d.e,
-  gpm: parseFloat(((d.p - d.e) / d.p * 100).toFixed(1)),
-  anomali: d.e > d.p * 0.9,
-}));
-
 // ─────────────────────────────────────────────────────────────
-// 2. KOMPONEN UI KECIL (Helper Components)
+// 4. UI COMPONENTS
 // ─────────────────────────────────────────────────────────────
 const CTip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
@@ -78,8 +159,7 @@ const SecTitle = ({ icon, children }) => (
   </div>
 );
 
-// ─── FITUR BARU: Alert Banner ────────────────────────────────
-const AlertBanner = ({ alerts }) => {
+const AlertBanner = ({ alerts, onDismiss }) => {
   if (alerts.length === 0) return null;
   return (
     <div style={{ padding: "12px 16px", background: P.surface, borderBottom: `1px solid ${P.border}` }}>
@@ -92,17 +172,20 @@ const AlertBanner = ({ alerts }) => {
           borderLeft: `3px solid ${alert.type === "critical" ? P.red : P.amber}`
         }}>
           <span style={{ fontSize: 14 }}>{alert.type === "critical" ? "🚨" : "⚠️"}</span>
-          <div>
+          <div style={{ flex: 1 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: P.text }}>{alert.title}</div>
             <div style={{ fontSize: 11, color: P.sub, marginTop: 2 }}>{alert.message}</div>
           </div>
+          <button onClick={() => onDismiss(i)} style={{
+            background: "none", border: "none", color: P.muted, cursor: "pointer",
+            fontSize: 14, padding: "0 4px"
+          }}>✕</button>
         </div>
       ))}
     </div>
   );
 };
 
-// ─── FITUR BARU: Goal Tracker Card ───────────────────────────
 const GoalCard = ({ label, current, target, unit, color }) => {
   const pct = Math.min(100, Math.round((current / target) * 100));
   const isMet = current >= target;
@@ -136,45 +219,123 @@ const GoalCard = ({ label, current, target, unit, color }) => {
   );
 };
 
+const DataManagement = ({ isOpen, onClose, onExport, onClear, dataCount, lastUpdate }) => {
+  if (!isOpen) return null;
+  return (
+    <div style={{
+      position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+      background: "rgba(0,0,0,0.8)", zIndex: 1000,
+      display: "flex", alignItems: "center", justifyContent: "center"
+    }}>
+      <div style={{
+        background: P.surface, border: `1px solid ${P.border}`,
+        borderRadius: 16, padding: "24px", width: "90%", maxWidth: 400
+      }}>
+        <div style={{ fontSize: 16, fontWeight: 700, color: P.text, marginBottom: 16 }}>
+          📁 Manajemen Data
+        </div>
+        
+        <div style={{ fontSize: 11, color: P.sub, marginBottom: 20 }}>
+          <div style={{ marginBottom: 8 }}>• Total bulan: <strong style={{ color: P.cyan }}>{dataCount}</strong></div>
+          <div>• Terakhir update: <strong style={{ color: P.cyan }}>{lastUpdate || "Belum pernah"}</strong></div>
+        </div>
+
+        <div style={{ display: "grid", gap: 10 }}>
+          <button onClick={onExport} style={{
+            background: P.cyan, color: P.bg, border: "none",
+            borderRadius: 8, padding: "12px", fontSize: 13, fontWeight: 700,
+            cursor: "pointer", fontFamily: "inherit"
+          }}>
+            📤 Export Data (JSON)
+          </button>
+          <button onClick={() => {
+            const template = "bulan,pendapatan,beban\nJul'24,285,198\nAgu'24,312,215";
+            const blob = new Blob([template], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'template_keuangan.csv';
+            a.click();
+          }} style={{
+            background: P.surfaceHigh, color: P.text, border: `1px solid ${P.border}`,
+            borderRadius: 8, padding: "12px", fontSize: 13, fontWeight: 700,
+            cursor: "pointer", fontFamily: "inherit"
+          }}>
+            📄 Download Template CSV
+          </button>
+          <button onClick={onClear} style={{
+            background: `${P.red}20`, color: P.red, border: `1px solid ${P.red}40`,
+            borderRadius: 8, padding: "12px", fontSize: 13, fontWeight: 700,
+            cursor: "pointer", fontFamily: "inherit"
+          }}>
+            🗑️ Reset Data
+          </button>
+        </div>
+
+        <button onClick={onClose} style={{
+          marginTop: 16, width: "100%",
+          background: P.border, color: P.sub, border: "none",
+          borderRadius: 8, padding: "10px", fontSize: 12,
+          cursor: "pointer", fontFamily: "inherit"
+        }}>
+          Tutup
+        </button>
+      </div>
+    </div>
+  );
+};
+
 // ─────────────────────────────────────────────────────────────
-// 3. KOMPONEN UTAMA (Dashboard, AI, Proyeksi)
+// 5. MAIN COMPONENTS
 // ─────────────────────────────────────────────────────────────
 
-function Dashboard({ onImportCSV, importStatus, goals }) {
-  // Data diakses dari props atau context (disini kita pakai window untuk simplifikasi demo)
+function Dashboard({ onImportCSV, importStatus, goals, onOpenDataMgmt }) {
   const DATA = window.__APP_DATA || [];
   const LATEST = DATA[DATA.length - 1] || {};
   const PREV = DATA[DATA.length - 2] || {};
   const KAS = 1290;
   const RUNWAY = Math.floor(KAS / (LATEST.beban || 1));
   const ANOMALIES = DATA.filter(d => d.anomali);
-
   const pct = (a, b) => b ? (((a - b) / b) * 100).toFixed(1) : 0;
 
   return (
     <div style={{ padding: "16px" }}>
-      {/* FITUR: Import CSV */}
-      <SecTitle icon="📊">Ringkasan — {LATEST.bulan || "Mar 2025"}</SecTitle>
       <div style={{ marginBottom: 16, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
         <label style={{
           background: P.surface, border: `1px dashed ${P.border}`,
           borderRadius: 10, padding: "10px 14px", cursor: "pointer",
-          display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: P.sub
+          display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: P.sub,
+          transition: "all 0.2s"
         }}>
           <span>📥</span> Import CSV
-          <input type="file" accept=".csv" onChange={onImportCSV} style={{ display: "none" }} />
+          <input type="file" accept=".csv,.txt" onChange={onImportCSV} style={{ display: "none" }} />
         </label>
-        {importStatus === "loading" && <span style={{ fontSize: 11, color: P.cyan }}>⏳ Memproses...</span>}
-        {importStatus?.startsWith("success") && <span style={{ fontSize: 11, color: P.green }}>✅ Data diperbarui!</span>}
-        {importStatus?.startsWith("error") && <span style={{ fontSize: 11, color: P.red }}>❌ {importStatus.split(':')[1]}</span>}
-        <a href={`data:text/csv;charset=utf-8,${encodeURIComponent('bulan,pendapatan,beban\nJul\'24,285,198')}`} 
-           download="template_keuangan.csv"
-           style={{ fontSize: 10, color: P.muted, textDecoration: "none", marginLeft: "auto" }}>
-           📄 Download Template
-        </a>
+        
+        <button onClick={onOpenDataMgmt} style={{
+          background: P.surface, border: `1px solid ${P.border}`,
+          borderRadius: 10, padding: "10px 14px", cursor: "pointer",
+          fontSize: 11, color: P.sub, fontFamily: "inherit"
+        }}>
+          ⚙️ Kelola Data
+        </button>
+
+        {importStatus === "loading" && (
+          <span style={{ fontSize: 11, color: P.cyan, display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 8, height: 8, border: `2px solid ${P.cyan}`, borderTopColor: "transparent", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+            Memproses...
+          </span>
+        )}
+        {importStatus?.startsWith("success") && (
+          <span style={{ fontSize: 11, color: P.green }}>✅ {importStatus.split(':')[1] || 'Data diperbarui!'}</span>
+        )}
+        {importStatus?.startsWith("error") && (
+          <span style={{ fontSize: 11, color: P.red }}>❌ {importStatus.split(':')[1]}</span>
+        )}
+        
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
       </div>
 
-      {/* KPI Cards */}
+      <SecTitle icon="📊">Ringkasan — {LATEST.bulan || "Mar 2025"}</SecTitle>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 24 }}>
         <KCard label="Pendapatan" value={LATEST.pendapatan || 0} unit="Jt" d={pct(LATEST.pendapatan, PREV.pendapatan)} accent={P.cyan} />
         <KCard label="Laba Bersih" value={LATEST.laba || 0} unit="Jt" d={pct(LATEST.laba, PREV.laba)} accent={LATEST.laba > 0 ? P.green : P.red} />
@@ -185,7 +346,6 @@ function Dashboard({ onImportCSV, importStatus, goals }) {
           alert={RUNWAY <= 6} sub={`Aman s/d ${["Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"][((2 + RUNWAY) % 12)]} '25`} />
       </div>
 
-      {/* FITUR: Goal Tracker */}
       <SecTitle icon="🎯">Target vs Aktual</SecTitle>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 24 }}>
         <GoalCard label="Pendapatan Bulanan" current={LATEST.pendapatan || 0} target={goals.pendapatan} unit="Jt" color={P.cyan} />
@@ -198,12 +358,10 @@ function Dashboard({ onImportCSV, importStatus, goals }) {
           alignItems: "center", textAlign: "center"
         }}>
           <div style={{ fontSize: 20, marginBottom: 4 }}>⚙️</div>
-          <div style={{ fontSize: 10, color: P.muted }}>Edit target di kode</div>
-          <div style={{ fontSize: 9, color: P.sub, marginTop: 2 }}>App.jsx line 260</div>
+          <div style={{ fontSize: 10, color: P.muted }}>Edit target di App.jsx</div>
         </div>
       </div>
 
-      {/* Charts */}
       <SecTitle icon="📈">Tren Pendapatan vs Beban</SecTitle>
       <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 12, padding: "16px 4px 8px", marginBottom: 20 }}>
         <ResponsiveContainer width="100%" height={190}>
@@ -276,34 +434,30 @@ function Dashboard({ onImportCSV, importStatus, goals }) {
   );
 }
 
-function AnalisisAI({ aiText, aiLoading, callAI }) {
-  const DATA = window.__APP_DATA || [];
-  const LATEST = DATA[DATA.length - 1] || {};
-  const RUNWAY = 4; // Dummy for safety if data empty
-  const ANOMALIES = DATA.filter(d => d.anomali);
-
+function AnalisisAI({ aiText, aiLoading, callAI, hasData }) {
   return (
     <div style={{ padding: "16px" }}>
-      <SecTitle icon="🤖">Executive Summary AI</SecTitle>
+      <SecTitle icon="🤖">Executive Summary AI (Groq)</SecTitle>
       <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 12, padding: 20, marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: P.sub, lineHeight: 1.7, marginBottom: 18, textAlign: "center" }}>
-          AI akan menganalisis data keuangan 9 bulan dan menghasilkan ringkasan eksekutif, deteksi risiko, dan rekomendasi aksi spesifik.
+          AI akan menganalisis data keuangan menggunakan Groq Llama 3.1 dan menghasilkan ringkasan eksekutif, deteksi risiko, dan rekomendasi aksi.
         </div>
         <div style={{ display: "flex", justifyContent: "center" }}>
-          <button onClick={callAI} disabled={aiLoading} style={{
-            background: aiLoading ? P.border : P.cyan, color: aiLoading ? P.muted : P.bg,
+          <button onClick={callAI} disabled={aiLoading || !hasData} style={{
+            background: aiLoading || !hasData ? P.border : P.cyan, 
+            color: aiLoading || !hasData ? P.muted : P.bg,
             border: "none", borderRadius: 8, padding: "11px 28px",
-            fontSize: 13, fontWeight: 700, cursor: aiLoading ? "not-allowed" : "pointer",
+            fontSize: 13, fontWeight: 700, cursor: aiLoading || !hasData ? "not-allowed" : "pointer",
             fontFamily: "inherit", transition: "opacity 0.2s",
           }}>
-            {aiLoading ? "⏳ Menganalisis data..." : "⚡ Generate Analisis AI"}
+            {aiLoading ? "⏳ Menganalisis..." : !hasData ? "📥 Upload data dulu" : "⚡ Generate Analisis AI"}
           </button>
         </div>
       </div>
 
       {aiLoading && (
         <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 12, padding: 28, textAlign: "center" }}>
-          <div style={{ fontSize: 13, color: P.muted }}>AI sedang membaca data keuangan Anda...</div>
+          <div style={{ fontSize: 13, color: P.muted }}>Groq AI sedang membaca data keuangan Anda...</div>
           <div style={{ marginTop: 12, display: "flex", gap: 6, justifyContent: "center" }}>
             {[0, 1, 2].map(i => (
               <div key={i} style={{
@@ -326,23 +480,6 @@ function AnalisisAI({ aiText, aiLoading, callAI }) {
           </div>
         </div>
       )}
-
-      <div style={{ marginTop: 20 }}>
-        <SecTitle icon="📋">Data Input ke AI</SecTitle>
-        {DATA.map((d, i) => (
-          <div key={i} style={{
-            display: "flex", justifyContent: "space-between", alignItems: "center",
-            padding: "9px 0", borderBottom: `1px solid ${P.border}`, fontSize: 12,
-          }}>
-            <div style={{ color: P.sub, width: 60 }}>{d.bulan}</div>
-            <div style={{ color: P.cyan, fontFamily: "monospace" }}>Rp {d.pendapatan}Jt</div>
-            <div style={{ color: P.red, fontFamily: "monospace" }}>Rp {d.beban}Jt</div>
-            <div style={{ color: d.laba >= 0 ? P.green : P.red, fontFamily: "monospace", fontWeight: 700 }}>
-              {d.laba >= 0 ? "+" : ""}{d.laba}Jt
-            </div>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }
@@ -352,11 +489,10 @@ function Proyeksi() {
   const DATA = window.__APP_DATA || [];
   const LATEST = DATA[DATA.length - 1] || {};
   
-  // Simple forecast logic
   const last3p = DATA.slice(-3).map(d => d.pendapatan);
   const last3e = DATA.slice(-3).map(d => d.beban);
-  const trendP = (last3p[2] - last3p[0]) / 2;
-  const trendE = (last3e[2] - last3e[0]) / 2;
+  const trendP = last3p.length >= 2 ? (last3p[2] - last3p[0]) / 2 : 0;
+  const trendE = last3e.length >= 2 ? (last3e[2] - last3e[0]) / 2 : 0;
   
   const FCAST = ["Apr'25", "Mei'25", "Jun'25"].map((bulan, i) => {
     const p = Math.round((LATEST.pendapatan || 0) + trendP * (i + 1));
@@ -371,6 +507,15 @@ function Proyeksi() {
     laba: Math.round(f.laba * mult),
   }));
   const chartData = [...DATA.slice(-4).map(d => ({ ...d, type: "aktual" })), ...adj.map(d => ({ ...d, type: "proyeksi" }))];
+
+  if (DATA.length === 0) {
+    return (
+      <div style={{ padding: "16px", textAlign: "center", color: P.sub }}>
+        <div style={{ fontSize: 40, marginBottom: 16 }}>📥</div>
+        <div>Upload data terlebih dahulu untuk melihat proyeksi</div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ padding: "16px" }}>
@@ -427,30 +572,12 @@ function Proyeksi() {
           </div>
         ))}
       </div>
-
-      <SecTitle icon="💡">What-If Analysis</SecTitle>
-      <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 12, padding: "14px 16px" }}>
-        <div style={{ fontSize: 12, color: P.sub, lineHeight: 1.7 }}>
-          <div style={{ marginBottom: 8, display: "flex", gap: 8, alignItems: "flex-start" }}>
-            <span style={{ color: P.green, fontSize: 14 }}>✓</span>
-            <span><strong style={{ color: P.text }}>Skenario Optimis (+18%):</strong> Pendapatan bisa mencapai Rp {Math.round(adj[2].pendapatan)}Jt di Jun'25 jika kampanye marketing efektif.</span>
-          </div>
-          <div style={{ marginBottom: 8, display: "flex", gap: 8, alignItems: "flex-start" }}>
-            <span style={{ color: P.red, fontSize: 14 }}>✗</span>
-            <span><strong style={{ color: P.text }}>Skenario Pesimis (−18%):</strong> Runway bisa memendek signifikan jika tren Jan-Feb'25 berulang.</span>
-          </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-            <span style={{ color: P.amber, fontSize: 14 }}>!</span>
-            <span><strong style={{ color: P.text }}>Prioritas:</strong> Tekan burn rate di bawah Rp 260Jt/bulan agar GPM kembali ke zona aman ≥20%.</span>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. MAIN APP COMPONENT (Logic Integrasi)
+// 6. MAIN APP
 // ─────────────────────────────────────────────────────────────
 export default function App() {
   const [tab, setTab] = useState("dashboard");
@@ -458,60 +585,65 @@ export default function App() {
   const [aiLoading, setAiLoading] = useState(false);
   const [importStatus, setImportStatus] = useState(null);
   const [alerts, setAlerts] = useState([]);
+  const [showDataMgmt, setShowDataMgmt] = useState(false);
   
-  // Target Goals
   const [goals] = useState({
     pendapatan: 400,
     gpm: 25,
     runway: 6
   });
 
-  // Load Data (LocalStorage or Default)
+  // Load Data
   const [DATA, setDATA] = useState(() => {
-    const saved = localStorage.getItem('financial_data');
-    if (saved) {
-      try { return JSON.parse(saved); } catch(e) { console.error(e); }
-    }
+    try {
+      const saved = localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch(e) { console.error("Load data error:", e); }
     return processData(RAW_DEFAULT);
   });
 
-  // Make data accessible globally for child components (Simple Demo Pattern)
+  const [lastUpdate, setLastUpdate] = useState(() => {
+    try {
+      const saved = localStorage.getItem('financial_timestamp');
+      return saved || null;
+    } catch { return null; }
+  });
+
   useEffect(() => {
     window.__APP_DATA = DATA;
   }, [DATA]);
 
-  // Derived Metrics
   const LATEST = DATA[DATA.length - 1] || {};
   const PREV = DATA[DATA.length - 2] || {};
   const KAS = 1290;
   const RUNWAY = Math.floor(KAS / (LATEST.beban || 1));
   const ANOMALIES = DATA.filter(d => d.anomali);
 
-  // ─── FITUR: Alert System Logic ─────────────────────────────
+  // Alert System
   const checkAlerts = useCallback(() => {
     const newAlerts = [];
     if (!LATEST.pendapatan) return;
 
     if (LATEST.gpm < 15) {
-      newAlerts.push({ type: "warning", title: "⚠️ Margin Tipis", message: `GPM ${LATEST.gpm}% di bawah target 15%. Segera review struktur beban.` });
+      newAlerts.push({ type: "warning", title: "⚠️ Margin Tipis", message: `GPM ${LATEST.gpm}% di bawah target 15%. Review struktur beban.` });
     }
     if (RUNWAY < 3) {
-      newAlerts.push({ type: "critical", title: "🚨 Runway Kritis", message: `Kas hanya cukup untuk ${RUNWAY} bulan. Prioritaskan fundraising atau cut cost.` });
+      newAlerts.push({ type: "critical", title: "🚨 Runway Kritis", message: `Kas hanya cukup untuk ${RUNWAY} bulan. Prioritaskan fundraising.` });
     }
     const burnGrowth = PREV.beban ? ((LATEST.beban - PREV.beban) / PREV.beban) * 100 : 0;
     if (burnGrowth > 10) {
-      newAlerts.push({ type: "warning", title: "📈 Burn Rate Naik", message: `Beban naik ${burnGrowth.toFixed(1)}% vs bulan lalu. Cek pos pengeluaran.` });
+      newAlerts.push({ type: "warning", title: "📈 Burn Rate Naik", message: `Beban naik ${burnGrowth.toFixed(1)}% vs bulan lalu.` });
     }
     const last2Loss = DATA.slice(-2).every(d => d.laba < 0);
     if (last2Loss) {
-      newAlerts.push({ type: "critical", title: "🔴 Rugi Beruntun", message: "Laba negatif 2 bulan berturut-turut. Evaluasi model bisnis segera." });
+      newAlerts.push({ type: "critical", title: "🔴 Rugi Beruntun", message: "Laba negatif 2 bulan berturut-turut." });
     }
     setAlerts(newAlerts);
   }, [LATEST, PREV, RUNWAY, DATA]);
 
   useEffect(() => { checkAlerts(); }, [checkAlerts]);
 
-  // ─── FITUR: Export WhatsApp ────────────────────────────────
+  // Export WhatsApp
   const exportToWA = useCallback(() => {
     const summary = `📊 *LAPORAN KEUANGAN - ${LATEST.bulan}*
 🏢 Logika Financial AI
@@ -527,72 +659,109 @@ export default function App() {
 • Runway: ${RUNWAY} bulan
 • Kas Tersedia: Rp ${KAS}Jt
 
-${ANOMALIES.length > 0 ? `🚨 *Anomali Terdeteksi*: ${ANOMALIES.map(a => a.bulan).join(', ')}` : '✅ *Tidak ada anomali*'}
-
-📈 *Tren 3 Bulan Terakhir*
-${DATA.slice(-3).map(d => `• ${d.bulan}: Laba Rp ${d.laba}Jt (${d.gpm}%)`).join('\n')}
+${ANOMALIES.length > 0 ? `🚨 *Anomali*: ${ANOMALIES.map(a => a.bulan).join(', ')}` : '✅ *Tidak ada anomali*'}
 
 ---
-Generated by Logika Financial AI
-${new Date().toLocaleDateString('id-ID')}`;
+Generated: ${new Date().toLocaleDateString('id-ID')}`;
 
-    const encoded = encodeURIComponent(summary);
-    window.open(`https://wa.me/?text=${encoded}`, '_blank');
-  }, [LATEST, RUNWAY, KAS, ANOMALIES, DATA]);
+    window.open(`https://wa.me/?text=${encodeURIComponent(summary)}`, '_blank');
+  }, [LATEST, RUNWAY, KAS, ANOMALIES]);
 
-  // ─── FITUR: Import CSV Logic ───────────────────────────────
-  const parseCSV = (text) => {
-    const lines = text.trim().split('\n');
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-    const pIdx = headers.findIndex(h => h.includes('pendapatan') || h === 'p');
-    const eIdx = headers.findIndex(h => h.includes('beban') || h === 'e');
-    const bIdx = headers.findIndex(h => h.includes('bulan') || h === 'b');
-    
-    if (pIdx === -1 || eIdx === -1) throw new Error("Format CSV tidak valid. Harus ada kolom: bulan, pendapatan, beban");
-    
-    return lines.slice(1).map(line => {
-      const vals = line.split(',').map(v => v.trim());
-      const p = parseFloat(vals[pIdx]) || 0;
-      const e = parseFloat(vals[eIdx]) || 0;
-      return {
-        b: vals[bIdx] || "", p, e,
-        laba: p - e,
-        gpm: p > 0 ? parseFloat(((p - e) / p * 100).toFixed(1)) : 0,
-        anomali: e > p * 0.9
-      };
-    });
-  };
-
+  // Import CSV
   const handleImportCSV = useCallback((e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    if (file.size > 2 * 1024 * 1024) {
+      setImportStatus("error: File terlalu besar (max 2MB)");
+      setTimeout(() => setImportStatus(null), 3000);
+      e.target.value = '';
+      return;
+    }
+
     setImportStatus("loading");
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
-        const parsed = parseCSV(evt.target.result);
-        if (parsed.length === 0) throw new Error("Data kosong");
-        localStorage.setItem('financial_data', JSON.stringify(parsed));
-        setDATA(parsed);
-        setImportStatus("success");
+        const { data, errors, warnings } = parseCSV(evt.target.result, file.name);
+        
+        if (errors.length > 0) {
+          throw new Error(errors.join(', '));
+        }
+
+        const processed = processData(data);
+        localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(processed));
+        localStorage.setItem('financial_timestamp', new Date().toLocaleString('id-ID'));
+        setDATA(processed);
+        setLastUpdate(new Date().toLocaleString('id-ID'));
+        setImportStatus(`success: ${data.length} bulan diimport`);
         setTimeout(() => setImportStatus(null), 2000);
       } catch (err) {
         setImportStatus("error: " + err.message);
-        setTimeout(() => setImportStatus(null), 3000);
+        setTimeout(() => setImportStatus(null), 5000);
       }
+    };
+    reader.onerror = () => {
+      setImportStatus("error: Gagal membaca file");
+      setTimeout(() => setImportStatus(null), 3000);
     };
     reader.readAsText(file);
     e.target.value = '';
   }, []);
 
-  // ─── FITUR: AI Call Logic ──────────────────────────────────
+  // Export Data (JSON Backup)
+  const handleExportData = useCallback(() => {
+    const backup = {
+      version: "2.0",
+      exportedAt: new Date().toISOString(),
+      data: DATA,
+      goals: goals,
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup_keuangan_${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [DATA, goals]);
+
+  // Clear Data
+  const handleClearData = useCallback(() => {
+    if (window.confirm("⚠️ Yakin ingin reset semua data? Ini tidak bisa dibatalkan.")) {
+      localStorage.removeItem(CONFIG.STORAGE_KEY);
+      localStorage.removeItem('financial_timestamp');
+      setDATA(processData(RAW_DEFAULT));
+      setLastUpdate(null);
+      setShowDataMgmt(false);
+      setImportStatus("success: Data direset");
+      setTimeout(() => setImportStatus(null), 2000);
+    }
+  }, []);
+
+  // Dismiss Alert
+  const dismissAlert = useCallback((index) => {
+    setAlerts(prev => prev.filter((_, i) => i !== index));
+  }, []);
+
+  // ─── GROQ API CALL ─────────────────────────────────────────
   const callAI = useCallback(async () => {
     setAiLoading(true);
     setAiText("");
+    
+    // ⚠️ API Key dari environment variable
+    const apiKey = import.meta.env?.VITE_GROQ_API_KEY || process.env?.REACT_APP_GROQ_API_KEY;
+
+    if (!apiKey) {
+      setAiText("❌ API Key Groq tidak ditemukan.\n\nCara setup:\n1. Buat file .env di root project\n2. Isi: VITE_GROQ_API_KEY=gsk_xxxxx\n3. Restart server (npm run dev)");
+      setAiLoading(false);
+      return;
+    }
+
     try {
       const prompt = `Kamu adalah CFO AI untuk perusahaan menengah Indonesia. Berikan executive summary keuangan dalam Bahasa Indonesia yang tajam dan actionable.
 
-DATA KEUANGAN 9 BULAN (Jul 2024 – Mar 2025):
+DATA KEUANGAN 9 BULAN:
 ${DATA.map(d => `${d.bulan}: Pendapatan Rp${d.pendapatan}Jt | Beban Rp${d.beban}Jt | Laba Rp${d.laba}Jt | GPM ${d.gpm}%`).join("\n")}
 
 METRIK KRITIS:
@@ -618,23 +787,32 @@ Format response PERSIS seperti ini (gunakan emoji, bahasa eksekutif, tegas):
 • [Aksi 3 — spesifik, ada timeline]
 
 📈 OUTLOOK 3 BULAN
-[2 kalimat proyeksi Apr–Jun 2025 berdasarkan tren data]`;
+[2 kalimat proyeksi berdasarkan tren data]`;
 
-      // ⚠️ Ganti dengan endpoint backend Anda di production
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
+          model: "llama-3.1-70b-versatile",
           messages: [{ role: "user", content: prompt }],
+          temperature: 0.7,
+          max_tokens: 1024,
         }),
       });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.message || `HTTP ${res.status}`);
+      }
+
       const data = await res.json();
-      const text = data.content?.map(b => b.text || "").join("") || "Gagal mendapat respons.";
+      const text = data.choices?.[0]?.message?.content || "Gagal mendapat respons.";
       setAiText(text);
-    } catch {
-      setAiText("❌ Koneksi ke AI gagal. Coba lagi.");
+    } catch (err) {
+      setAiText(`❌ Error: ${err.message}\n\nPastikan:\n• API Key valid\n• Koneksi internet aktif\n• Kuota Groq tersedia`);
     }
     setAiLoading(false);
   }, [DATA, LATEST, RUNWAY, KAS, ANOMALIES]);
@@ -671,7 +849,6 @@ Format response PERSIS seperti ini (gunakan emoji, bahasa eksekutif, tegas):
           </div>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              {/* FITUR: Tombol Export WA */}
               <button onClick={exportToWA} style={{
                 background: "#25D366", color: "#06090F",
                 border: "none", borderRadius: 8,
@@ -685,20 +862,37 @@ Format response PERSIS seperti ini (gunakan emoji, bahasa eksekutif, tegas):
               <div style={{
                 background: `${P.green}20`, border: `1px solid ${P.green}44`,
                 borderRadius: 20, padding: "3px 9px", fontSize: 10, color: P.green, fontWeight: 700,
-              }}>● DEMO LIVE</div>
+              }}>● GROQ AI</div>
             </div>
             <div style={{ fontSize: 10, color: P.muted }}>{LATEST.bulan || "Mar 2025"}</div>
           </div>
         </div>
       </div>
 
-      {/* FITUR: Alert Banner */}
-      {alerts.length > 0 && <AlertBanner alerts={alerts} />}
+      {/* Alert Banner */}
+      {alerts.length > 0 && <AlertBanner alerts={alerts} onDismiss={dismissAlert} />}
 
       {/* Content */}
-      {tab === "dashboard" && <Dashboard onImportCSV={handleImportCSV} importStatus={importStatus} goals={goals} />}
-      {tab === "analisis" && <AnalisisAI aiText={aiText} aiLoading={aiLoading} callAI={callAI} />}
+      {tab === "dashboard" && (
+        <Dashboard 
+          onImportCSV={handleImportCSV} 
+          importStatus={importStatus} 
+          goals={goals}
+          onOpenDataMgmt={() => setShowDataMgmt(true)}
+        />
+      )}
+      {tab === "analisis" && <AnalisisAI aiText={aiText} aiLoading={aiLoading} callAI={callAI} hasData={DATA.length > 0} />}
       {tab === "proyeksi" && <Proyeksi />}
+
+      {/* Data Management Modal */}
+      <DataManagement 
+        isOpen={showDataMgmt}
+        onClose={() => setShowDataMgmt(false)}
+        onExport={handleExportData}
+        onClear={handleClearData}
+        dataCount={DATA.length}
+        lastUpdate={lastUpdate}
+      />
 
       {/* Bottom Nav */}
       <div style={{
